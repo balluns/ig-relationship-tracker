@@ -1,3 +1,4 @@
+<img width="1877" height="878" alt="tracker" src="https://github.com/user-attachments/assets/8ecc82a9-9dd2-40fa-83d4-0e02d358a9c7" />
 # 📊 In-Browser Instagram Relationship Tracker
 
 A lightweight, client-side, zero-dependency tool with a modern floating UI overlay designed to inspect and analyze follower relationships (non-followers, fans, and mutual connections) directly within the browser session.
