@@ -12,18 +12,17 @@
   const existingModal = document.getElementById("ig-tracker-modal");
   if (existingModal) existingModal.remove();
 
-  // Nuovo AbortController registrato a livello globale
+  // Nuovo AbortController globale per prevenire ghost runs
   let abortController = new AbortController();
   window.__igTrackerAbort = abortController;
 
   const FALLBACK_AVATAR = "https://static.cdninstagram.com/rsrc.php/v3/y6/r/_j_hL6y04g0.png";
   const STORAGE_KEY = "ig_tracker_whitelist_v2";
-  const SESSION_HOURLY_KEY = "ig_hourly_unfollows_v2";
-  const SESSION_BLOCK_KEY = "ig_unfollow_block_until_v2";
+  const STORAGE_HOURLY_KEY = "ig_hourly_unfollows_v2";
+  const STORAGE_BLOCK_KEY = "ig_unfollow_block_until_v2";
   const MAX_HOURLY_UNFOLLOWS = 30;
 
   // --- UTILITY ---
-  // Sleep con rimozione esplicita del listener su signal (zero memory leaks)
   const sleep = (ms, signal) =>
     new Promise((resolve, reject) => {
       if (signal?.aborted) return reject(new DOMException("Aborted", "AbortError"));
@@ -52,7 +51,7 @@
       "'": "&#39;",
     }[c]));
 
-  // LocalStorage v2 per Whitelist
+  // LocalStorage protetto per Whitelist
   const getStoredWhitelist = () => {
     try {
       return new Set(JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]"));
@@ -69,10 +68,10 @@
     }
   };
 
-  // Gestione tetto orario persistente su sessionStorage (sopravvive al reload della pagina)
+  // Tetto orario persistente su localStorage (valido tra schede e dopo il reload)
   const getHourlyUnfollows = () => {
     try {
-      const raw = sessionStorage.getItem(SESSION_HOURLY_KEY);
+      const raw = localStorage.getItem(STORAGE_HOURLY_KEY);
       const list = raw ? JSON.parse(raw) : [];
       const now = Date.now();
       return list.filter((t) => now - t < 3600000);
@@ -85,14 +84,14 @@
     const list = getHourlyUnfollows();
     list.push(Date.now());
     try {
-      sessionStorage.setItem(SESSION_HOURLY_KEY, JSON.stringify(list));
+      localStorage.setItem(STORAGE_HOURLY_KEY, JSON.stringify(list));
     } catch (_) {}
   };
 
-  // Blocco di sicurezza da Instagram (feedback_required / 429) persistente per 30 minuti
+  // Blocco temporaneo di sicurezza da Instagram (feedback_required / 429) per 30 minuti
   const getBlockUntil = () => {
     try {
-      return Number(sessionStorage.getItem(SESSION_BLOCK_KEY) || 0);
+      return Number(localStorage.getItem(STORAGE_BLOCK_KEY) || 0);
     } catch (_) {
       return 0;
     }
@@ -100,11 +99,11 @@
 
   const setBlockUntil = (ms) => {
     try {
-      sessionStorage.setItem(SESSION_BLOCK_KEY, String(ms));
+      localStorage.setItem(STORAGE_BLOCK_KEY, String(ms));
     } catch (_) {}
   };
 
-  // --- RECUPERO ACCOUNT CON VALIDAZIONE RIGOROSA ---
+  // --- RECUPERO ACCOUNT CON VALIDAZIONE RIGOROSA E FALLBACK USERNAME ---
   const getAccountInfo = async (signal) => {
     const rawCookie = getCookie("ds_user_id");
     let userId = rawCookie && /^\d+$/.test(rawCookie) ? rawCookie : null;
@@ -112,7 +111,6 @@
     let followingCount = 0;
     let followersCount = 0;
 
-    // Prova da endpoint autenticato
     try {
       const res = await fetch("https://www.instagram.com/api/v1/accounts/current_user/?edit=true", {
         headers: { "x-ig-app-id": "936619743392459" },
@@ -135,11 +133,25 @@
       if (/^\d+$/.test(vId)) userId = vId;
     }
 
+    // Fallback username dal DOM se l'endpoint edit non restituisce lo username
+    if (!username) {
+      try {
+        const profileLink = document.querySelector('a[href^="/"][role="link"] img[alt*="profile picture"], a[href^="/"][role="link"] img[alt*="profilo"]')?.closest('a');
+        if (profileLink) {
+          const href = profileLink.getAttribute("href") || "";
+          const matched = href.match(/^\/([a-zA-Z0-9._]+)\/?$/);
+          if (matched && matched[1] && matched[1] !== "explore" && matched[1] !== "direct") {
+            username = matched[1];
+          }
+        }
+      } catch (_) {}
+    }
+
     if (!userId) {
       throw new Error("Impossibile identificare lo User ID. Assicurati di essere loggato su instagram.com.");
     }
 
-    // Recupera conteggi reali per validazione completezza e progress bar
+    // Recupera conteggi reali per validazione completezza
     if (username) {
       try {
         const pRes = await fetch(
@@ -250,7 +262,7 @@
   };
   document.getElementById("ig-close-btn").onclick = closeModal;
 
-  // Fallback immagini rotte compatibile con CSP (fase di Capture)
+  // Fallback immagini rotte compatibile con CSP (Capture Phase)
   const usersListEl = document.getElementById("ig-users-list");
   usersListEl.addEventListener(
     "error",
@@ -275,7 +287,10 @@
   // Controllo integrità completezza dati
   let dataTrusted = false;
 
-  // Cooldown deterministico calcolato solo dopo l'esecuzione
+  // Mutex per evitare unfollow concorrenti in volo
+  let unfollowInFlight = false;
+
+  // Cooldown deterministico e gestione singolo pulsante in conferma
   let nextAllowedUnfollowAt = 0;
   let activeConfirmingBtn = null;
 
@@ -310,8 +325,8 @@
 
           if (res.status === 429) {
             retries++;
-            if (retries >= 3) break; // Non aspettare altri 15s se i tentativi sono esauriti
-            onProgress(`Rate limit (429). Pausa di sicurezza di 15s (${retries}/3)...`, usersMap.size);
+            if (retries >= 3) break;
+            onProgress(`Rate limit (429). Pausa di 15s (${retries}/3)...`, usersMap.size);
             await sleep(15000, signal);
             continue;
           }
@@ -391,6 +406,8 @@
   // --- RENDERING CON UI CONTESTUALE ---
   const renderList = () => {
     if (!modalContainer.isConnected) return;
+    activeConfirmingBtn = null; // Resetta riferimenti a pulsanti orfani
+
     const listEl = document.getElementById("ig-users-list");
     let items = categorized[currentTab] || [];
 
@@ -412,6 +429,7 @@
         const isWhitelisted = whitelist.has(user.id);
         const safeId = esc(user.id);
         const safeUsername = esc(user.username);
+        const encodedUrlUsername = encodeURIComponent(user.username);
         const safeFullName = esc(user.full_name);
         const safePic = esc(user.profile_pic_url);
 
@@ -437,7 +455,7 @@
             <img src="${safePic}" loading="lazy" style="width: 40px; height: 40px; border-radius: 50%; object-fit: cover; background: #2a2a2a;" alt="" />
             <div style="overflow: hidden;">
               <div style="display: flex; align-items: center; gap: 4px;">
-                <a href="https://www.instagram.com/${safeUsername}/" target="_blank" rel="noopener noreferrer" style="color: #fff; font-weight: 600; text-decoration: none; font-size: 13px;">${safeUsername}</a>
+                <a href="https://www.instagram.com/${encodedUrlUsername}/" target="_blank" rel="noopener noreferrer" style="color: #fff; font-weight: 600; text-decoration: none; font-size: 13px;">${safeUsername}</a>
                 ${user.is_verified ? '<span style="color: #0095f6; font-size: 12px;">✓</span>' : ""}
                 ${user.is_private ? '<span style="color: #888; font-size: 10px; border: 1px solid #444; border-radius: 4px; padding: 0 3px;">Privato</span>' : ""}
               </div>
@@ -478,7 +496,7 @@
       return;
     }
 
-    // 2. Unfollow con Protezioni Complete
+    // 2. Unfollow con Protezioni Complete e Mutex
     const unfollowBtn = e.target.closest(".unfollow-btn");
     if (unfollowBtn) {
       if (isScanning) {
@@ -487,14 +505,14 @@
       }
 
       if (!dataTrusted) {
-        showToast("Dati non affidabili (liste incomplete o non verificate). Riscansiona.", "#ff9800");
+        showToast("Dati non verificati o incompleti. Riscansiona per abilitare gli unfollow.", "#ff9800");
         return;
       }
 
       const blockUntil = getBlockUntil();
       if (Date.now() < blockUntil) {
         const minLeft = Math.ceil((blockUntil - Date.now()) / 60000);
-        showToast(`Unfollow sospesi per sicurezza: Instagram ha limitato l'azione. Attendi ${minLeft} min.`, "#f44336");
+        showToast(`Unfollow sospesi: Instagram ha limitato le azioni. Attendi ${minLeft} min.`, "#f44336");
         return;
       }
 
@@ -504,7 +522,7 @@
         return;
       }
 
-      // Inline confirmation
+      // Pattern Inline Confirm
       if (!unfollowBtn.dataset.confirming) {
         if (activeConfirmingBtn && activeConfirmingBtn !== unfollowBtn) {
           delete activeConfirmingBtn.dataset.confirming;
@@ -526,7 +544,12 @@
         return;
       }
 
-      // Secondo clic: esecuzione controllata da cooldown deterministico
+      // Secondo clic confermato: verifica Mutex & Cooldown
+      if (unfollowInFlight) {
+        showToast("Un'operazione è già in corso. Attendi...", "#ff9800");
+        return;
+      }
+
       const now = Date.now();
       if (now < nextAllowedUnfollowAt) {
         const secWait = Math.ceil((nextAllowedUnfollowAt - now) / 1000);
@@ -543,6 +566,8 @@
       const username = unfollowBtn.dataset.username;
       const csrf = getCookie("csrftoken");
 
+      unfollowInFlight = true;
+
       try {
         const res = await fetch(`https://www.instagram.com/api/v1/friendships/destroy/${id}/`, {
           method: "POST",
@@ -555,12 +580,13 @@
           credentials: "include",
         });
 
+        // Fissa il cooldown deterministico (3.5s - 6s) SEMPRE
+        nextAllowedUnfollowAt = Date.now() + 3500 + Math.random() * 2500;
+
         const data = await res.json().catch(() => null);
 
         if (res.ok && data?.status === "ok") {
           recordUnfollowAction();
-          nextAllowedUnfollowAt = Date.now() + 3500 + Math.random() * 2500;
-
           unfollowBtn.textContent = "Rimosso ✓";
           unfollowBtn.style.background = "#2e7d32";
           showToast(`Hai smesso di seguire @${username}`, "#4caf50");
@@ -569,7 +595,7 @@
         } else {
           if (res.status === 429 || data?.feedback_required) {
             setBlockUntil(Date.now() + 30 * 60 * 1000);
-            showToast("Instagram ha rilevato troppe azioni rapide. Unfollow sospesi per 30 minuti.", "#f44336");
+            showToast("Instagram ha rilevato troppe azioni. Unfollow sospesi per 30 minuti.", "#f44336");
           } else {
             showToast(data?.message || "Azione non consentita da Instagram.", "#f44336");
           }
@@ -577,9 +603,12 @@
           unfollowBtn.disabled = false;
         }
       } catch {
+        nextAllowedUnfollowAt = Date.now() + 3500 + Math.random() * 2500;
         showToast("Errore di connessione.", "#f44336");
         unfollowBtn.textContent = "Errore";
         unfollowBtn.disabled = false;
+      } finally {
+        unfollowInFlight = false;
       }
     }
   });
@@ -623,10 +652,11 @@
     }
   };
 
-  // --- AVVIO SCANSIONE CON ATOMIC COMMIT & VALIDAZIONE COMPLETEZZA ---
+  // --- AVVIO SCANSIONE CON ATOMIC COMMIT & TOLLERANZA STRETTA ---
   document.getElementById("ig-start-btn").onclick = async () => {
     if (isScanning) return;
     isScanning = true;
+    dataTrusted = false; // INVALIDA SUBITO
 
     const startBtn = document.getElementById("ig-start-btn");
     const statusText = document.getElementById("ig-status-text");
@@ -682,9 +712,17 @@
 
       if (!modalContainer.isConnected) return;
 
-      // VALIDAZIONE COMPLETEZZA (Tolleranza 3% per account disattivati o ban nel frattempo)
-      const tooFew = (got, expected) => expected > 0 && got < expected * 0.97;
-      const isComplete = !(tooFew(following.length, followingCount) || tooFew(followers.length, followersCount));
+      // VALIDAZIONE COMPLETEZZA STRETTA (Massimo 5 account mancanti o 0.5% per disattivazioni naturali)
+      const countsKnown = followingCount > 0 && followersCount > 0;
+      const maxFollowingTol = Math.min(5, Math.max(1, Math.ceil(followingCount * 0.005)));
+      const maxFollowersTol = Math.min(5, Math.max(1, Math.ceil(followersCount * 0.005)));
+
+      const diffFollowing = followingCount - following.length;
+      const diffFollowers = followersCount - followers.length;
+
+      const isFollowingOk = countsKnown && diffFollowing <= maxFollowingTol && following.length <= followingCount + 5;
+      const isFollowersOk = countsKnown && diffFollowers <= maxFollowersTol && followers.length <= followersCount + 5;
+      const isComplete = isFollowingOk && isFollowersOk;
 
       // ATOMIC COMMIT
       allFollowing = following;
@@ -694,13 +732,23 @@
       const timeStr = new Date().toLocaleTimeString();
       progBar.style.width = "100%";
 
-      if (!isComplete && (followingCount > 0 || followersCount > 0)) {
-        statusText.textContent = "Attenzione: Liste parziali rilevate.";
+      if (!countsKnown) {
+        statusText.textContent = "Scansione completata (Conteggi profilo non disponibili).";
+        scanState.textContent = `Aggiornato alle ${timeStr} (Non verificato - Unfollow disattivati)`;
+        showToast("Conteggi profilo non verificabili: unfollow disattivati per sicurezza.", "#ff9800");
+      } else if (!isComplete) {
+        // Dettaglio esatto delle discrepanze rilevate
+        const discrepancyParts = [];
+        if (!isFollowingOk) discrepancyParts.push(`seguiti: ${following.length}/${followingCount}`);
+        if (!isFollowersOk) discrepancyParts.push(`follower: ${followers.length}/${followersCount}`);
+        const discrepancyDetail = discrepancyParts.join(", ");
+
+        statusText.textContent = `Attenzione: discrepanza rilevata (${discrepancyDetail}).`;
         scanState.textContent = `Aggiornato alle ${timeStr} (Dati parziali - Unfollow disattivati)`;
-        showToast("Liste incomplete rispetto al profilo: unfollow disattivati per sicurezza.", "#ff9800");
+        showToast(`Discrepanza con i dati del profilo (${discrepancyDetail}). Unfollow disattivati per sicurezza.`, "#ff9800");
       } else {
-        statusText.textContent = "Scansione completata al 100%!";
-        scanState.textContent = `Ultimo aggiornamento: ${timeStr}`;
+        statusText.textContent = "Scansione completata e verificata con successo!";
+        scanState.textContent = `Ultimo aggiornamento verificato: ${timeStr}`;
         showToast("Scansione completata con successo!", "#4caf50");
       }
 
@@ -712,7 +760,7 @@
         console.error(err);
         if (modalContainer.isConnected) {
           statusText.textContent = `Errore: ${err.message}`;
-          scanState.textContent = "Scansione fallita (Dati non aggiornati)";
+          scanState.textContent = "Scansione fallita (Dati non affidabili - Unfollow disattivati)";
           showToast(err.message, "#f44336");
         }
       }
