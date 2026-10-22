@@ -23,6 +23,7 @@
   const MAX_HOURLY_UNFOLLOWS = 30;
 
   // --- UTILITY ---
+  // Sleep con rimozione esplicita del listener su signal (zero memory leaks)
   const sleep = (ms, signal) =>
     new Promise((resolve, reject) => {
       if (signal?.aborted) return reject(new DOMException("Aborted", "AbortError"));
@@ -103,7 +104,7 @@
     } catch (_) {}
   };
 
-  // --- RECUPERO ACCOUNT CON VALIDAZIONE RIGOROSA E FALLBACK USERNAME ---
+  // --- RECUPERO ACCOUNT CON VALIDAZIONE RIGOROSA E FALLBACK UNIVERSALE ---
   const getAccountInfo = async (signal) => {
     const rawCookie = getCookie("ds_user_id");
     let userId = rawCookie && /^\d+$/.test(rawCookie) ? rawCookie : null;
@@ -133,15 +134,19 @@
       if (/^\d+$/.test(vId)) userId = vId;
     }
 
-    // Fallback username dal DOM se l'endpoint edit non restituisce lo username
+    // Fallback username universale (esclude tutte le rotte di sistema note)
     if (!username) {
       try {
-        const profileLink = document.querySelector('a[href^="/"][role="link"] img[alt*="profile picture"], a[href^="/"][role="link"] img[alt*="profilo"]')?.closest('a');
-        if (profileLink) {
-          const href = profileLink.getAttribute("href") || "";
-          const matched = href.match(/^\/([a-zA-Z0-9._]+)\/?$/);
-          if (matched && matched[1] && matched[1] !== "explore" && matched[1] !== "direct") {
-            username = matched[1];
+        const navLinks = Array.from(document.querySelectorAll('nav a[href^="/"], div[role="navigation"] a[href^="/"]'));
+        const systemRoutes = new Set([
+          "", "explore", "reels", "direct", "notifications", "create", 
+          "stories", "accounts", "threads", "ads", "about", "help", "meta"
+        ]);
+        for (const link of navLinks) {
+          const path = (link.getAttribute("href") || "").replace(/^\/|\/$/g, "").split("/")[0];
+          if (path && !systemRoutes.has(path.toLowerCase()) && !path.startsWith("p/")) {
+            username = path;
+            break;
           }
         }
       } catch (_) {}
@@ -406,7 +411,7 @@
   // --- RENDERING CON UI CONTESTUALE ---
   const renderList = () => {
     if (!modalContainer.isConnected) return;
-    activeConfirmingBtn = null; // Resetta riferimenti a pulsanti orfani
+    activeConfirmingBtn = null;
 
     const listEl = document.getElementById("ig-users-list");
     let items = categorized[currentTab] || [];
@@ -737,15 +742,15 @@
         scanState.textContent = `Aggiornato alle ${timeStr} (Non verificato - Unfollow disattivati)`;
         showToast("Conteggi profilo non verificabili: unfollow disattivati per sicurezza.", "#ff9800");
       } else if (!isComplete) {
-        // Dettaglio esatto delle discrepanze rilevate
+        // Dettaglio esatto delle discrepanze rilevate con spiegazione cache
         const discrepancyParts = [];
         if (!isFollowingOk) discrepancyParts.push(`seguiti: ${following.length}/${followingCount}`);
         if (!isFollowersOk) discrepancyParts.push(`follower: ${followers.length}/${followersCount}`);
         const discrepancyDetail = discrepancyParts.join(", ");
 
-        statusText.textContent = `Attenzione: discrepanza rilevata (${discrepancyDetail}).`;
-        scanState.textContent = `Aggiornato alle ${timeStr} (Dati parziali - Unfollow disattivati)`;
-        showToast(`Discrepanza con i dati del profilo (${discrepancyDetail}). Unfollow disattivati per sicurezza.`, "#ff9800");
+        statusText.textContent = `Discrepanza: ${discrepancyDetail}. (Se hai fatto unfollow di recente, attendi 5 min)`;
+        scanState.textContent = `Aggiornato alle ${timeStr} (Dati parziali o cache Instagram in ritardo)`;
+        showToast(`Discrepanza (${discrepancyDetail}). Se hai rimosso profili di recente, la cache si aggiornerà a breve.`, "#ff9800");
       } else {
         statusText.textContent = "Scansione completata e verificata con successo!";
         scanState.textContent = `Ultimo aggiornamento verificato: ${timeStr}`;
